@@ -362,6 +362,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
+
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:

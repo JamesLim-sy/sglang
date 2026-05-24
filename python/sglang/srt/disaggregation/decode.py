@@ -468,6 +468,7 @@ class DecodePreallocQueue:
                 break
 
             allocatable_tokens -= required_tokens_for_request
+            # 1. alloc page for req
             self._pre_alloc(decode_req.req)
 
             kv_indices = (
@@ -523,6 +524,8 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
+
+            # send the page indices to prefill side for pre-allocating kv cache
             decode_req.kv_receiver.init(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )

@@ -198,11 +198,15 @@ class HiCacheFile(HiCacheStorage):
         target_location: torch.Tensor,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
+        # 设置 suffix key 信息.
         key = self._get_suffixed_key(key)
+
+        # 设置这个 page_tensor 的 ssd level path, 写成 .bin 文件
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
+                # 将 dst_tensor buffer 化, 直接由文件读入.
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
                 if f.readinto(buf) != expected:
                     raise IOError(f"Short read for {key}")
@@ -213,7 +217,7 @@ class HiCacheFile(HiCacheStorage):
 
     def batch_get(
         self,
-        keys: List[str],
+        keys: List[str],  # hashes values
         target_locations: List[torch.Tensor],
         target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:

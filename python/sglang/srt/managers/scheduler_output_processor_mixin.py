@@ -107,6 +107,8 @@ class SchedulerOutputProcessorMixin:
                     continue
 
                 if req.is_chunked <= 0:
+                    # 处理正常 prefill 情形.
+
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
@@ -176,6 +178,7 @@ class SchedulerOutputProcessorMixin:
                     )
 
                 else:
+                    # 处理 chunked prefill 情形.
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
                     # There is only at most one request being currently chunked.

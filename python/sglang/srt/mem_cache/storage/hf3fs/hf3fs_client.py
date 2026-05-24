@@ -82,7 +82,6 @@ class Hf3fsMockClient(Hf3fsClient):
         self.check(offsets, tensors)
 
         results = []
-
         for offset, tensor in zip(offsets, tensors):
             size = tensor.numel() * tensor.itemsize
 

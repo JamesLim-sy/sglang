@@ -81,11 +81,12 @@ class HiRadixCache(RadixCache):
 
         (
             extra_config,
-            prefetch_threshold,
+            prefetch_threshold,  # 默认值 256 tokens
             prefetch_timeout_base,
             prefetch_timeout_per_ki_token,
             hicache_storage_pass_prefix_keys,
         ) = self._parse_storage_backend_extra_config(storage_backend_extra_config)
+
         self.prefetch_threshold = prefetch_threshold
         self.prefetch_timeout_base = prefetch_timeout_base
         self.prefetch_timeout_per_page = (
@@ -228,6 +229,18 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
+    """
+        触发场景1: write_back 策略下, device cache node 先 D2H 备份到 host caches, 然后再被 evict
+        触发场景2: insert 场景下, 含有 dev kvcahe 某个 tree_node 被命中次数超 threshold, 直接启动 node level 的 H2D
+
+        write 逻辑:
+            1. 为 node 分配 host_kvcache indices 信息;
+            2. 如果 host kvcache pool 满了, 就开始执行 evict 策略;
+            3. node + host_indices + device_indices 组成 Operation 送入 cc.write_queue
+            4. 直接在 cc.write_stream 上启动 full layers 的 D2H 操作
+            5. 给这个 node 配置 cuda_event, 送入 cc.ack_write_queue, 待下一轮 writting_check()
+    """
+
     def write_backup(self, node: TreeNode, write_back=False):
         host_indices = self.cache_controller.write(
             device_indices=node.value,
@@ -239,8 +252,10 @@ class HiRadixCache(RadixCache):
                 device_indices=node.value,
                 node_id=node.id,
             )
+
         if host_indices is not None:
-            node.host_value = host_indices
+            node.host_value = host_indices  # --> node.backuped = True
+
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
             if not write_back:
@@ -276,6 +291,23 @@ class HiRadixCache(RadixCache):
                 self.write_backup(node)
 
     def writing_check(self, write_back=False):
+        """
+        >> 目的:
+        - 尽可能地释放 ongoing_write_through 中的 TreeNode, 增加可驱逐 TreeNode 的数量;
+        - ack_write_queue 中存储的 node_id 对应 ongoing_write_through 中的 TreeNode
+
+        >> 行逻辑:
+        1. 面对 write_back 场景, 要确保 ongoing_write_through 中的 TreeNode 全部完成 D2H 操作;
+        2. 面对 write_through 场景, 用 query 策略检查完成 D2H 的 TreeNode 数量.
+        3. 随后采用 AllReduceMin 同步 TP_worker 上各 rank 完成 D2H 的 TreeNode 数量的最小值;
+            以保证所有 TP_worker 上的 HiradixCache 做出相同的 evict 决策, 从而保持 RadixTree 的一致性.
+
+        >> 注: write_back 策略下不需要 lock_ref 的保护.
+
+        2.  lock_ref 设计目的是保证高并发场景下 TreeNode 不会被竞争关系而驱逐, 是一种引用计数类机制.
+            当系统被剥流, 待 waitting_queue/disagg_queue 中全部请求都完成后, RadixTree 上的全部请求
+            均不再被 lock_ref 保护. 除 RootNode 外, 所有 TreeNode 都可能被驱逐, 以释放 GPU 内存.
+        """
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
@@ -309,6 +341,7 @@ class HiRadixCache(RadixCache):
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
+
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
@@ -316,12 +349,18 @@ class HiRadixCache(RadixCache):
                     self.write_backup_storage(backuped_node)
             finish_count -= 1
 
+    """
+        目的: 同 writing_check, 通过检查 ack_load_queue 中的事件完成情况,
+             释放 ongoing_load_back 中的 TreeNode, 增加可驱逐 TreeNode 数量.
+    """
+
     def loading_check(self):
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
             if not finish_event.query():
                 # the KV cache loading is still ongoing
                 break
+
             finish_count += 1
             # no need to sync across TP workers as batch forwarding is synced
             for ack_id in ack_list:
@@ -334,23 +373,35 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
+    """
+        1. 针对 write_back 策略, 被evict 的 device node 直接写入 host, 拉起 start_loading 服务.
+        2. write_back 策略看起来并不需要 lock_ref 作保护.
+    """
+
     def evict(self, num_tokens: int):
         start_time = time.perf_counter()
         leaves = self._collect_leaves_device()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
+
+        """
+        输入: eviction_heap 是一个包含 (priority, node) 元组的列表，其中 priority 是由 self.eviction_strategy.get_priority(node) 计算出来的优先级值。
+        操作: heapify() 重新组织这个列表的元素，使其满足堆的性质：父节点的优先级 ≤ 所有子节点的优先级（小根堆）;
+        效果: 堆顶（索引 0) 始终是优先级最小的元素, 之后可以通过 heapq.heappop() 高效地逐个弹出优先级最小的节点;
+        """
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
         write_back_nodes = []
         while num_evicted < num_tokens and len(eviction_heap):
+            # heapq.heappop() 高效地逐个弹出优先级最小的节点;
             _priority, x = heapq.heappop(eviction_heap)
 
             if x.lock_ref > 0:
                 continue
 
-            if not x.backuped:
+            if not x.backuped:  # host_cache is None
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
                     num_evicted += self.write_backup(x, write_back=True)
@@ -361,7 +412,7 @@ class HiRadixCache(RadixCache):
                 num_evicted += self._evict_backuped(x)
 
             for child in x.parent.children.values():
-                if child in write_back_nodes:
+                if child in write_back_nodes:  # 针对 write_back 场景
                     continue
                 if not child.evicted:
                     break
@@ -371,6 +422,8 @@ class HiRadixCache(RadixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
         if self.cache_controller.write_policy == "write_back":
+            # 强制要求写完
+            # 强制要求写完
             self.writing_check(write_back=True)
             for node in write_back_nodes:
                 assert node.backuped
@@ -390,10 +443,13 @@ class HiRadixCache(RadixCache):
         # evict a node not initiated write to host
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
+
+        # 额外多出一步, 删除这个 tree_node 在 parent 中的存在
         self._delete_leaf(node)
         return num_evicted
 
     def evict_host(self, num_tokens: int):
+        # 收集策略按照传统策略收集
         leaves = self._collect_leaves()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -405,11 +461,14 @@ class HiRadixCache(RadixCache):
             _priority, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
+
             # only evict the host value of evicted nodes
+            # NOTE(james): 只针对 pure host kvcache 的 tree node
             if not x.evicted:
                 continue
 
             # node is protected from eviction as it has ongoing prefetch or backup to storage
+            # NOTE(james): host node 与 device node 走不同的引用计数保护规则.
             if x.host_ref_counter > 0:
                 continue
 
@@ -424,14 +483,33 @@ class HiRadixCache(RadixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
+    """
+        >> 目的:
+        - 携带 host_cache 的 TreeNode 被命中后, 需要将 KVCache 由 H2D 迁移回 GPU 内存,
+        - 此时执行 H2D 的前置准备, 主要是腾出 enough device memory nodes 供 load back 使用.
+        - 将这些 node 的 device_indices 和 host_indices 以 Operation 的形式关联, 送入 cc.load_queue
+
+        >> 逻辑:
+        1. 找到 last_host_node, 从底向上遍历 parent_nodes, 将仅携带 host_cache 的 parent_node
+           按祖宗->孙子的顺序, 记录至 nodes_to_load 列表内;
+        2. 聚合 host_cache_node 携带 node_indices;
+        3. 如果 dev node 数量不够, 则执行 evict() 策略, 腾出足够的 nodes with device_value
+
+        >> 注意:
+        1. 在 evict() 之前增加保护.
+        2. 服务于 start_loading 操作, 将 H2D 的 Node 执行 inc_lock_ref() 保护, 直到 loading_check()
+        3. ongoing_load_back 中记录的是 这条 host cache nodes 链条中的最底层的 node
+    """
+
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
         # todo: more loading policies
 
         start_time = time.perf_counter()
-        last_hit_node = node
+        last_hit_node = node  # last_host_node
         nodes_to_load = []
+
         while node.evicted:
             assert (
                 node.backuped
@@ -482,6 +560,12 @@ class HiRadixCache(RadixCache):
 
         return device_indices
 
+    """
+        目的: 寻找 match_nodes 中仅含 host_cache 的 TreeNode, 采用包括 evict 策略的方式
+             为这些 host kvcache nodes 腾出 gpu kvcache 空间,
+             为这些 tree nodes 赋予 device kvcache values
+    """
+
     def init_load_back(
         self,
         last_node: TreeNode,
@@ -489,6 +573,8 @@ class HiRadixCache(RadixCache):
         mem_quota: Optional[int] = None,
     ):
         _ = host_hit_length  # unused, but kept for compatibility
+
+        # 如果 last_host_node 仅有 host_value 部分. 执行 load back 策略
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
@@ -517,11 +603,13 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
 
+    # 处理 ssd 阶段产生的 prefetch revoke, backup ack, host mem release 等事件.
     def drain_storage_control_queues(self):
         """
         Combine prefetch revoke, backup ack, and host mem release checks
@@ -537,6 +625,7 @@ class HiRadixCache(RadixCache):
             ],
             dtype=torch.int,
         )
+
         if self.tp_world_size > 1:
             torch.distributed.all_reduce(
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
@@ -559,6 +648,7 @@ class HiRadixCache(RadixCache):
             operation = cc.ack_backup_queue.get()
             ack_id = operation.id
             entry = self.ongoing_backup.pop(ack_id, None)
+
             if entry is not None:
                 entry.release_host()
             if self.enable_storage_metrics:
@@ -570,6 +660,7 @@ class HiRadixCache(RadixCache):
         host_indices_list = []
         for _ in range(n_release):
             host_indices_list.append(cc.host_mem_release_queue.get())
+
         if host_indices_list:
             host_indices = torch.cat(host_indices_list, dim=0)
             cc.mem_pool_host.free(host_indices)
@@ -583,18 +674,38 @@ class HiRadixCache(RadixCache):
             + len(operation.hash_value) * self.prefetch_timeout_per_page
         )
 
+    """
+        >> 这个策略本质不是“花哨”，而是分布式里最朴素的两条规则同时满足：
+        1. 正常收敛: ALL(local_can_terminate)
+        2. 取消传播: ANY(local_terminated)
+
+        为什么要这样：
+        1. 只有 ALL(can_terminate) 不够
+            某个 rank 已经被取消/中止了，其他 rank 还在等“全部满足”，可能一直等不到，容易卡住。
+        2. 只有 ANY(can_terminate) 也不行
+            一个快 rank 先满足就全停，会过早终止，其他 rank 的 prefetch 还没到位，结果不稳定。
+
+        所以这不是“智慧技巧”，是“防两种死法”的组合：
+        - 防半停半跑 (split-brain)
+        - 防取消后卡死 (liveness 问题)
+
+        可以把它当成：
+        - ALL 是正常结束条件
+        - ANY 是紧急刹车广播
+    """
+
     def can_terminate_prefetch(self, operation: PrefetchOperation):
         can_terminate = True
 
         if self.prefetch_stop_policy == "best_effort":
             return can_terminate
 
-        if len(operation.hash_value) == 0:
-            completed = False
-        else:
-            completed = (
-                operation.completed_tokens == len(operation.hash_value) * self.page_size
-            )
+        # if len(operation.hash_value) == 0:
+        #     completed = False
+        # else:
+        completed = (
+            operation.completed_tokens == len(operation.hash_value) * self.page_size
+        )
 
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
@@ -604,7 +715,9 @@ class HiRadixCache(RadixCache):
             # unknown prefetch stop policy, just return True
             return True
 
+        # operation 内部自我确认 是否结束了.
         operation_terminated = operation.is_terminated()
+
         if self.tp_world_size > 1:
             states = torch.tensor(
                 [1 - int(can_terminate), int(operation_terminated)],
@@ -619,7 +732,10 @@ class HiRadixCache(RadixCache):
             operation_terminated = states[1].item() == 1
         # the operation should be terminated if it is already terminated on any TP worker
         # or it meets the termination condition on all TP workers
-        can_terminate = can_terminate or operation_terminated
+        can_terminate = (
+            can_terminate  # 代表 all_rank_terminated
+            or operation_terminated  # 代表 any_rank_terminated
+        )
         return can_terminate
 
     def check_prefetch_progress(self, req_id: str) -> bool:
@@ -629,9 +745,12 @@ class HiRadixCache(RadixCache):
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
-            req_id
-        ]
+        (
+            last_host_node,
+            token_ids,  # rest_input_tokens
+            host_indices,
+            operation,
+        ) = self.ongoing_prefetch[req_id]
 
         if operation.host_indices is None:
             # prefetch has not been issued due to insufficient host memory
@@ -640,6 +759,8 @@ class HiRadixCache(RadixCache):
         if not self.can_terminate_prefetch(operation):
             return False
 
+        # num_hit_pages = storage_hit_count // self.page_size
+        # operation.hash_value = hash_value[:num_hit_pages]
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
@@ -657,8 +778,12 @@ class HiRadixCache(RadixCache):
                 group=self.tp_group,
             )
             min_completed_tokens = completed_tokens_tensor.item()
+
         fetched_token_ids = token_ids[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
+
+        # 将这些已经从 ssd cache 搬运到 memory_host_pool kvache 上的 written_indices;
+        # 插入至 last_host_node 甚至其 children host tree_node 上.
         matched_length = self._insert_helper_host(
             last_host_node,
             RadixKey(
@@ -668,9 +793,13 @@ class HiRadixCache(RadixCache):
             hash_value[: min_completed_tokens // self.page_size],
         )
 
+        # TODO(james): append_host_mem_release 这部分的资源管理应全部放在 cc 内, 而不是暴露给其他 thread 调用,
+        #  以免造成调用混乱.
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
+            # host_indices[min_completed_tokens : len(operation.host_indices])]
         )
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
@@ -686,6 +815,7 @@ class HiRadixCache(RadixCache):
     def match_prefix(self, key: RadixKey, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         key.token_ids = self.key_convert_fn(key.token_ids)
+
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=empty_value,
@@ -706,25 +836,34 @@ class HiRadixCache(RadixCache):
 
         host_hit_length = 0
         last_host_node = last_node
+
+        # 往上迭代查询, 直至找到第一个挂 dev kvcache 的 tree_node
         while last_node.evicted:
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
+        last_dev_node = last_node
+
+        """
+            必须要落到存在 host kvcache 的 tree node 上, 避免后续被 evict_regular 误删了,
+            进而导致后续匹配时, 这一段的 ssd 上的 kvcache 失效, 因为已经断开了.
+        """
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
         return MatchResult(
             device_indices=value,
-            last_device_node=last_node,
+            last_device_node=last_dev_node,
             last_host_node=last_host_node,
             host_hit_length=host_hit_length,
         )
 
+    # 从 storage backend 中进行预取操作.
     def prefetch_from_storage(
         self,
         req_id: str,
         last_host_node: TreeNode,
         new_input_tokens: List[int],
-        last_hash: Optional[str] = None,
+        last_hash: Optional[str] = None,  # last_host_page_hash
         prefix_keys: Optional[List[str]] = None,
     ):
         # align the number of fetching tokens to the page size
@@ -732,6 +871,7 @@ class HiRadixCache(RadixCache):
             len(new_input_tokens) % self.page_size
         )
         new_input_tokens = new_input_tokens[:prefetch_length]
+
         if (
             not self.enable_storage
             or prefetch_length < self.prefetch_threshold
@@ -739,26 +879,40 @@ class HiRadixCache(RadixCache):
         ):
             return
 
+        # last_host_node 进行保护
         last_host_node.protect_host()
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+
         if host_indices is None:
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+
+        # no sufficient host memory for prefetch
         if host_indices is None:
-            last_host_node.release_host()
-            # no sufficient host memory for prefetch
+            last_host_node.release_host()  # 与 protect_host 配对使用.
             return
+
+        # 包装成 PrefetchOperation 并送入 cc.prefetch_queue 供后台线程执行预取操作
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            req_id,
+            host_indices,
+            new_input_tokens,
+            last_hash,  # last_host_page_hash
+            prefix_keys,
         )
+
+        # 记录在 HiCache 中正在进行的 prefetch 操作
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             new_input_tokens,
             host_indices,
             operation,
         )
+
+        # TODO(james): prefetch_tokens_occupied 并不一定全都能命中 ssd cache.
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
 
+    # NOTE(james): 这里的起始 node 是 last_host_node.
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
     ):
@@ -772,8 +926,10 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
+
             prefix_len = self.key_match_fn(node.key, key)
             key = key[prefix_len:]
+
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
@@ -804,10 +960,14 @@ class HiRadixCache(RadixCache):
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(child.key, key)
+
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+
+                # node.value 存在的话
                 if not new_node.evicted:
                     value.append(new_node.value)
+
                 node = new_node
                 break
             else:
@@ -826,7 +986,7 @@ class HiRadixCache(RadixCache):
         new_node = TreeNode()
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
-        new_node.lock_ref = child.lock_ref
+        new_node.lock_ref = child.lock_ref  # lock_ref 改换门庭喽
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
 
@@ -836,13 +996,16 @@ class HiRadixCache(RadixCache):
         else:
             new_node.value = child.value[:split_len]
             child.value = child.value[split_len:]
+
         if child.backuped:
             new_node.host_value = child.host_value[:split_len]
             child.host_value = child.host_value[split_len:]
 
+        # hashes 也要 split.
         if child.hash_value:
             new_node.hash_value = child.hash_value[: split_len // self.page_size]
             child.hash_value = child.hash_value[split_len // self.page_size :]
+
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
@@ -865,10 +1028,13 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
+
             prefix_len = self.key_match_fn(node.key, key)
 
             if prefix_len == len(node.key):
+                # node 没有挂上 kvcache 信息, 在 load_back_threshold 不满足时生效.
                 if node.evicted:
+
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
                     node.value = value[:prefix_len]
@@ -893,6 +1059,7 @@ class HiRadixCache(RadixCache):
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
+        # 把没有挂在 RadixTree 上的 key, 组装一个 new_node 挂上去.
         if len(key):
             new_node = TreeNode()
             new_node.parent = node
@@ -903,9 +1070,11 @@ class HiRadixCache(RadixCache):
 
             if self.enable_storage:
                 last_hash = node.get_last_hash_value()
+
                 assert (node == self.root_node) or (
                     last_hash is not None
                 ), "Parent node must have a hash value with storage enabled"
+
                 new_node.hash_value = []
                 for idx in range(0, len(key), self.page_size):
                     new_node.hash_value.append(
@@ -916,9 +1085,17 @@ class HiRadixCache(RadixCache):
                     )
                     last_hash = new_node.hash_value[-1]
 
+            # 并给自己挂一次命中, 且如果 write_through_thresh = 1,  接着就触发 D2H
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
+
         return total_prefix_length
+
+    """
+        1. children nodes 中没有 device cache node;
+        2. node 中没有 device_cache;
+        3. 并非 root
+    """
 
     def _collect_leaves_device(self):
         def is_leaf(node):

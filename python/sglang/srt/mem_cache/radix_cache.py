@@ -122,6 +122,15 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
+    """
+        你观察得很接近，但不是遍历整棵 radix tree。
+        > get_prefix_hash_values(self, node) 实际做的是:
+
+        从当前 node 开始， 递归走 node.parent,
+            把路径上每个节点的 hash_value 依次拼接起来。
+            所以它拿到的是**“从根到该节点这条链路”**的前缀哈希，不是全树所有节点。
+    """
+
     @lru_cache(maxsize=1)
     def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
         if node is None or node.hash_value is None:
@@ -342,6 +351,7 @@ class RadixCache(BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         committed_kv_len = req.pop_committed_kv_cache()
+
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :committed_kv_len
@@ -404,17 +414,25 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
+        # 1. 设置: req.fill_ids = self.origin_input_ids + self.output_ids
         token_ids = req.fill_ids
         all_token_len = len(token_ids)
+
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
+
+        # 2. 找到 req 在 prefill 阶段 device kvcache indices (gpu tensor)信息.
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :all_token_len
         ]
 
+        # 3. 设置一个 page_aligned_kv_indices 的副本，长度是 page_size 整数倍
         if self.page_size != 1:
+            # 元整到 page_size 的长度信息.
             page_aligned_len = actual_kv_len // self.page_size * self.page_size
+
+            # 返回一个新的 kvcache_indices tensor 副本
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                 dtype=torch.int64, copy=True
             )
@@ -428,18 +446,23 @@ class RadixCache(BasePrefixCache):
         )
         page_aligned_token_ids = token_ids[:page_aligned_token_len]
 
+        # 这里的 prefix_indices = device_kvcache_ids + h2d_kvcache_ids
         old_prefix_len = len(req.prefix_indices)
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
 
+        # 4. 先对 req.kvcache_indices 执行 insert 操作.
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
             RadixKey(page_aligned_token_ids, req.extra_key),
             page_aligned_kv_indices,
             chunked=chunked,
         )
+
+        # 如果是组 batch 时, 轮流做 insert, 可能多个 req 之间有重复的 system prompt 之外的 prefix-tokens,
+        # 这些重复的部分只需要在 radix tree 中保留一份, 其他的都可以 free 掉, 避免内存泄漏.
         self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
 
         # The prefix indices could be updated, reuse it

@@ -1425,15 +1425,34 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
+        # 确认启动 hicache_storage
         if self.enable_hicache_storage:
+
+            # 完成 req.prefix_indices
+            #      req.last_node
+            #      req.last_host_node
+            #      req.host_hit_length
             req.init_next_round_input(self.tree_cache)
+
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
                 # otherwise, the allocated GPU memory must be locked for integrity
+
+                # 拿到 last_host_node 对应的 hash
+                """
+                注意:
+                1. insert() 时, 系统给每一个 page 设置对应的 hash, 不论这个 hash 对应 page 挂在 l1/l2/l3 cache 上。
+                    主要体现在 insert 阶段, 由于 tree_node 上的 kvcache indices length 可能超过 key length
+                2. get_lash_hash_value() 这个接口返回的 hash 是 last_host_node 对应的 hash,
+                """
                 last_hash = req.last_host_node.get_last_hash_value()
+
                 matched_len = len(req.prefix_indices) + req.host_hit_length
+
+                # 找到 dev_hit_lenght 和 host_hit_length 之外, 其余的 tokens, 暂时判断他们都在 l3 cache 上.
                 new_input_tokens = req.fill_ids[matched_len:]
 
+                # 递归得到的 hash
                 prefix_keys = (
                     req.last_node.get_prefix_hash_values(req.last_node.parent)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
@@ -1447,6 +1466,16 @@ class Scheduler(
                     prefix_keys,
                 )
 
+    """
+        ###############################################################
+        ################ 2026-03-29 Note On L3 HiCache ################
+        ###############################################################
+        1. 完成 handle_generate_request, 启动 _prefetch_kvcache, 将 L3 HiCache 拉起预取
+        2.
+        3.
+        4.
+    """
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
@@ -1455,6 +1484,7 @@ class Scheduler(
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
+
             req.time_stats.wait_queue_entry_time = time.perf_counter()
             trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1462,6 +1492,7 @@ class Scheduler(
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
+
             req.time_stats.prefill_bootstrap_queue_entry_time = time.perf_counter()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
@@ -1763,6 +1794,31 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
+        """
+            ################ 2026-03-28 Note On L2 HiCache ################
+            >>>
+            1. 执行 load_check 和 write_check, 增加 RadixTree 中可被 evict 的节点数量;
+            2. 针对 ssd cache 执行, 暂略.
+            3. 面对 prefix-match 时, 命中 host_caching 的部分执行 init_load_back,
+                3.1 确认 tree_node 中携带 host_cache 的 num_nodes, 并在 device_mem 中为其 evict 出空间
+                3.2 将刚被分配 device pages 且已拥有 host_cache pages 的 tree_node 送入 cc.load_queue.
+                3.3 init_load_back 可能因达不到 thresh 而不能触发.
+
+            4. 在 cc.load_queue 中启动搬运操作(load_stream):
+                4.1 设置对应 layer_transfer_queue idx, 并传给 model_fwd_batch
+                4.2 逐层启动搬运操作, 并逐层设置 layer_transfer_queue[idx].event[layer_id].record()
+
+            5. 针对非 chunked_prefill 请求, 执行 cache_unfinished_req(req):
+                5.1 将 prefix 之外 part-tokens 写入 TreeNode 中, 在 write-through 时;
+                    如果 thresh 设置为 1, 则紧随写入 host_cache 中;
+                5.2 由于可能组 batch 进入 cache_unfinished_req, 因此要对 req 进行 prefix kvache 去重;
+                5.3 因后续仍要参与计算, 因此保证 Req 中 last_node 上执行 lock_ref.
+
+            6. 执行 cache_finished_req(req), 将 req 从 req_to_token_pool 中 free 掉, 腾出 slot
+                对 req.last_node 进行向上执行 unlock_ref, 为后续计算腾出 dev kvcache pages.
+
+            注: cache_unfinished_req 主要为 batch pd disgg decode 服务.
+        """
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
@@ -1821,6 +1877,7 @@ class Scheduler(
                 if not adder.preempt_to_schedule(req, self.server_args):
                     break
 
+            # NOTE(james): 检查之前的 prefetch 动作是否结束.
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:

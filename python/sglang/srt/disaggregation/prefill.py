@@ -186,10 +186,16 @@ class PrefillBootstrapQueue:
         if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
             kv_sender_class = get_kv_class(TransferBackend.FAKE, KVClassType.SENDER)
         else:
+            # 走入 mooncake 的 sender
             kv_sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
 
         dest_tp_ranks = [self.tp_rank]
 
+        f"""
+            构建 req 内 sender 组件:
+            - bootstrap_host 由于 mass 服务的配置, 可能是预置的 prefill pod 地址 ip
+            - self.bootstrap_port 默认值不用填写, default: 8998
+        """
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
@@ -197,8 +203,10 @@ class PrefillBootstrapQueue:
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,
         )
-        self._process_req(req)
+        self._process_req(req)  # 设置 max_new_tokens 为 1.
         req.add_latency(RequestStage.PREFILL_PREPARE)
+
+        # NOTE(james): 在自己的 queue 中添加
         self.queue.append(req)
         trace_slice_end(RequestStage.PREFILL_PREPARE, req.rid, auto_next_anon=True)
 
@@ -274,7 +282,7 @@ class PrefillBootstrapQueue:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                 continue
 
-            # KV.WaitingForInput - init here
+            # Once KV.WaitingForInput - init here.
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
@@ -324,6 +332,44 @@ class SchedulerDisaggregationPrefillMixin:
             trace_event_batch("schedule", batch.reqs)
 
         return batch
+
+    """
+        NOTE(james): PD 分离时的起点
+        1. process_input_requests
+            >>> _add_request_to_queue,
+            a. add, 装入 PrefillBootstrapQueue 中 self.queue;
+            b. 初始化 ** req.disagg_kv_sender **
+        2. 调用 PrefillBootstrapQueue 执行 pop_bootstrapped()
+            a. 摘出 Failed 的 req 信息, 并记录至 failed_reqs;
+            b. 对于 WaitingForInput 的 req, 执行:
+                - alloc req.metadata_buffer_index;
+                - init req 对应的 original_input_ids 的 num_pages;
+                - ** req.disagg_kv_sender.init(); **
+                    kv_mgr.request_status[bootstrap_room] = KVPoll.Bootstrapping;
+                - num_kv_indices, 将这条 req 从 self.queue 中移除;
+        3. 后台: start_prefill_thread: recv_multipart()
+            a. 接收到相同 room 的 req.TransferInfo, 完成第 1 次 Req level 握手;
+            b. kv_mgr.request_status[bootstrap_room] = KPoll::WaitingForInput;
+        4. process_batch_result_disagg_prefill:
+            >>> 将 req 或者开启 chunked prefill 时, last chunk req 装入 disagg_prefill_inflight_queue
+            >>> send_kv_chunk(req, last_chunk)
+            a. start_send_idx 初始化为 0; 并设置 end_idx
+            b. 对于 chunked_prefill 的非末段, 圆整 end_idx 为 page_size
+            c. 从 req_to_token_pool 中拉取 req 对应 kv_indices, 只不过这里是 whole kvcache;
+            d. 将 output_ids 和 hidden_states 写入 disagg_metadata_buffers 内;
+            e. ** req.disagg_kv_sender.send(); **
+                - 将 kv_indices 和 idx_slice 进入 transfer_queues[shard_idx]
+            f. disagg_prefill_inflight_queue
+        6. 后台: transfer_worker 实际传输:
+            a. 经过 mooncake kv_transfer 实现 kv_cache 的传输, 传输完毕后,
+            b. kv_mgr.request_status[bootstrap_room] = KVPoll.Success
+        7. process_disagg_prefill_inflight_queue
+            a. 检查 queue 中 req.disagg_kv_sender 的 status
+                - 如果为 KVPoll.Success, 将 req 从 metadata_buffers, request_status 中移除, 加入 done_reqs
+                - 如果为 KVPoll.Failed, 报错 & 清除在 metadata_buffers, request_status 中的 req 信息, 加入 done_reqs
+                - 如果仍为 KVPoll.Bootstrapping 或者 KVPoll.WaitingForInput, 则加入 undone_reqs;
+            b. disagg_prefill_inflight_queue = undone_reqs;
+    """
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
@@ -427,10 +473,12 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            # 针对没有开启 chunked_prefill 情形.
             if req.is_chunked <= 0:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
-                self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                self.tree_cache.cache_unfinished_req(req)
+
                 req.add_latency(RequestStage.PREFILL_FORWARD)
                 trace_slice(RequestStage.PREFILL_FORWARD, req.rid, auto_next_anon=True)
                 self.disagg_prefill_inflight_queue.append(req)

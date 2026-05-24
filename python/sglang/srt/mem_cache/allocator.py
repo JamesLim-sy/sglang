@@ -428,10 +428,21 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool,
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
+        # 1. 设置 num_pages.
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
+        # 2. 设置扩展的规则.
         self.clear()
+
+    def clear(self):
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        self.free_pages = torch.arange(
+            1, self.num_pages + 1, dtype=torch.int64, device=self.device
+        )
+        self.is_not_in_free_group = True
+        self.free_group = []
+        self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
@@ -440,7 +451,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 need_size % self.page_size == 0
             ), "The allocation size should be page-aligned"
 
+        # 分析 need_size 对应的页数.
         num_pages = need_size // self.page_size
+        # 如果需要 sort, 且 num_pages 超过 free_pages 的数量, 则进行 merge_and_sort.
         if self.need_sort and num_pages > len(self.free_pages):
             self.merge_and_sort_free()
         if num_pages > len(self.free_pages):
@@ -449,8 +462,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
 
+        # 假设 page_size = 4，out_pages = tensor([3, 5])
+        # out_pages[:, None] * 4 得到 [[12],[20]]
+        # 加上偏移 [0,1,2,3] 得到 [[12,13,14,15],[20,21,22,23]]
+        # 展平
         out_indices = (
-            out_pages[:, None] * self.page_size
+            # out_pages[:, None] * self.page_size
+            out_pages.unsqueeze(-1) * self.page_size
             + torch.arange(self.page_size, device=self.device)
         ).reshape(-1)
 
@@ -472,7 +490,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.seen_max_num_extend_tokens_next_power_of_2 = max(
             self.seen_max_num_extend_tokens_next_power_of_2,
-            next_power_of_2(extend_num_tokens),
+            next_power_of_2(extend_num_tokens),  # 最邻近 2 的幂
         )
 
         bs = len(prefix_lens)
@@ -563,15 +581,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
-
-    def clear(self):
-        # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_pages = torch.arange(
-            1, self.num_pages + 1, dtype=torch.int64, device=self.device
-        )
-        self.is_not_in_free_group = True
-        self.free_group = []
-        self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)

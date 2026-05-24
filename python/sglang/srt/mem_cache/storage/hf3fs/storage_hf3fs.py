@@ -337,6 +337,11 @@ class HiCacheHF3FS(HiCacheStorage):
         keys: List[str],
         values: List[torch.Tensor],
     ) -> List[bool]:
+        """
+        NOTE(james):
+            1. keys 中是 k1 v1 k2 v2 ... 的轮替格式;
+            2. vals 中是 k1 v1 k2 v2... 的顺序格式，与 keys 对应
+        """
         page_indices = self.metadata_client.get_page_indices(self.rank, keys)
 
         batch_indices, file_offsets = [], []
@@ -363,6 +368,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
         end_time = time.perf_counter()
         ionum = len(batch_indices)
+
         self.prefetch_pgs.append(ionum)
         self.prefetch_bandwidth.append(
             ionum / (end_time - start_time) * self.gb_per_page
@@ -527,7 +533,16 @@ class HiCacheHF3FS(HiCacheStorage):
     def _batch_get_preprocess(self, keys, host_indices):
         page_num = len(host_indices) // self.mem_pool_host.page_size
         # host_indices to kv_buffer
+
+        """
+            NOTE(james):
+            1. 非 zero_copy 模式下才需要扁平化;
+            2. zero-copy 模式下直接映射到 page 上;
+            3. 设置 keys 来源于 hashes, 并分配不同的 keys for k or v;
+            4. 将 values 按照 k/v 分开存储;
+        """
         flat = not self.is_zero_copy
+
         values = (
             [
                 self.mem_pool_host.get_data_page(
@@ -561,10 +576,10 @@ class HiCacheHF3FS(HiCacheStorage):
         for i in range(page_num):
             if not results[i]:
                 break
+
             self.mem_pool_host.set_from_flat_data_page(
                 host_indices[i * self.mem_pool_host.page_size], values[i]
             )
-
         return results
 
     def batch_get_v1(
@@ -573,6 +588,11 @@ class HiCacheHF3FS(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        """
+        NOTE(james):
+        1. 将 k cache 和 v cache 分开存储在 hf3fs 中;
+        2. 因此要在 batch_get_preprocess 中对 keys 和 values 进行转换和扩展;
+        """
         keys, values = self._batch_get_preprocess(keys, host_indices)
         results = self._batch_get(keys, values)
         return self._batch_get_postprocess(host_indices, values, results)

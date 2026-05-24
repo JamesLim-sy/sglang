@@ -127,9 +127,11 @@ class CacheOperation:
         host_indices = torch.cat([op.host_indices for op in ops])
         device_indices = torch.cat([op.device_indices for op in ops])
         node_ids = []
+
         priority = min(op.priority for op in ops)
         for op in ops:
             node_ids.extend(op.node_ids)
+
         merged_op = CacheOperation(host_indices, device_indices, -1, priority)
         merged_op.node_ids = node_ids
         return merged_op
@@ -192,9 +194,9 @@ class StorageOperation:
 
     def __init__(
         self,
-        host_indices: torch.Tensor,
-        token_ids: List[int],
-        last_hash: Optional[str] = None,
+        host_indices: torch.Tensor,  # 刚刚从 host kvcache pool 强制分配出来的 host_indices
+        token_ids: List[int],  # rest_input_tokens, 用于计算 page hash 和 prefetch
+        last_hash: Optional[str] = None,  # last_host_page_hash
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
@@ -202,10 +204,13 @@ class StorageOperation:
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
-        self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
 
-        self.id = StorageOperation.counter
+        self.hash_value = hash_value if hash_value is not None else []
+
+        self.id = (
+            StorageOperation.counter
+        )  # 设置 StorageOperation 的唯一 ID, 用于跟踪和测试.
         StorageOperation.counter += 1
 
     def __lt__(self, other: "StorageOperation"):
@@ -223,6 +228,7 @@ class PrefetchOperation(StorageOperation):
     ):
         self.request_id = request_id
 
+        # 而 start_time, _lock, _terminated_flag 却是分离设置的.
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
@@ -342,6 +348,7 @@ class HiCacheController:
 
         self.stop_event = threading.Event()
         self.write_buffer = TransferBuffer(self.stop_event)
+
         self.load_buffer = TransferBuffer(
             self.stop_event, buffer_count=10, max_buffer_size=100
         )
@@ -486,23 +493,49 @@ class HiCacheController:
         return device_indices
 
     def move_indices(self, op: CacheOperation):
-        host_indices, device_indices = op.host_indices, op.device_indices
+        host_indices = op.host_indices
+        device_indices = op.device_indices
+
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
                 host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
+        #
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
                 device_indices = device_indices.cpu()
+                # 此时对 host_indices 进行排序, 保证连续性, 尽可能地发挥 direct IO 的性能.
                 host_indices, idx = host_indices.sort()
                 return host_indices, device_indices.index_select(0, idx)
+
             elif self.mem_pool_host.layout == "page_first_direct":
                 return host_indices, device_indices.cpu()
+        #
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices
+        #
         else:
             raise ValueError(f"Unsupported io backend")
+
+    """
+        1. 更新 producer_id, 以支持多 producer 的 overlap scheduler 执行;
+        2. 将 load_queue 中 Operations 合并成一个 op;
+        3. 真正执行 loading 操作时, 先完成一次 schedule stream 的sync,
+            保证之前调度的操作都已经完成 (含 alloc_page_ids triton kernel)
+
+        4. 逐层 loading, 每层 loading 时, 在 load stream 插入一个
+            event_queue[producer_id].load_events[layer_index].record()
+            等待 fwd_stream 执行 attention op 前, wait_until() this event.
+
+        5. 将 op 中最后一层的 event[-1], 搭配 op 本身装入 ack_load_queue.
+            供 cache.loading_check()
+
+        6. backbone fwd 计算完毕时, 调用
+
+        - 注: record_stream(self.load_stream)
+            保证 load_stream 上的任务完成前都, record 的 tensor 都不会被释放.
+    """
 
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
@@ -512,6 +545,7 @@ class HiCacheController:
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices = self.move_indices(op)
         self.load_queue.clear()
+
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
@@ -559,14 +593,18 @@ class HiCacheController:
         request_id: str,
         host_indices: torch.Tensor,
         new_input_tokens: List[int],
-        last_hash: Optional[str] = None,
+        last_hash: Optional[str] = None,  # last_host_page_hash
         prefix_keys: Optional[List[str]] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id,
+            host_indices,
+            new_input_tokens,
+            last_hash,  # last_host_page_hash
+            prefix_keys,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -578,6 +616,7 @@ class HiCacheController:
     def append_host_mem_release(self, host_indices: torch.Tensor):
         if host_indices.numel() == 0:
             return
+
         pages = host_indices.split(self.mem_pool_host.page_size)
         for page in pages:
             self.host_mem_release_queue.put(page)
@@ -588,6 +627,7 @@ class HiCacheController:
         results = self.storage_backend.batch_get_v1(
             hash_values, host_indices, extra_info
         )
+
         inc = 0
         for i in range(len(hash_values)):
             if not results[i]:
@@ -599,52 +639,81 @@ class HiCacheController:
         operation.increment(inc)
 
     # todo: deprecate
+    """
+        Default Page Get Function:
+        1. 设置 dummy page dst tensors (layer_first), 一定保证是 pinned cpu memory;
+        2. 找到 ssd cache 中 key 对应的 page_tensor path 的 .bin 文件;
+        3. 将 .bin 文件的内容写到 dummy_page_dst 这个 pinned tensor 内;
+        4. 将 dummy_page_dst 的内容设置到 host memory 中对应的 page 上.
+    """
+
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
         dummy_page_dst = [
             self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
         ]
         page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
+
         if page_data is None:
             return
+
         for i in range(len(hash_values)):
             if page_data[i] is None:
                 logger.warning(
-                    f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
+                    f"Prefetch operation {operation.request_id} "
+                    f"failed to retrieve page {hash_values[i]}."
                 )
                 break
+
             # Must set the data before increasing the completed tokens.
             # Otherwise this page may be read before being set.
             self.mem_pool_host.set_from_flat_data_page(
                 host_indices[i * self.page_size],
                 page_data[i],
             )
+
+            # NOTE(james): 如果触发 Operation termination, 说明当前 prefetch 操作不再需要.
+            #  由于 sche 线程的 best effort 策略会强制中断这里的操作. 因此如果被sche 线程强制触发,
+            #  那么本次的 get 操作尽管成功, 但
             if not operation.increment(self.page_size):
                 break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
+
+        # len(hash_value) 代表了 num_pages in l3 cache
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
+            # stride 是 storage_batch_size, 而以 page 为单位
+            # end = min(i + storage_batch_size, len(operation.hash_value))
+            # batch_hashed = operation.hash_value[i:end]
+
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
+
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+            self.page_get_func(
+                operation,
+                batch_hashes,  # stride 规模的 hashes
+                batch_host_indices,  # stride 规模的 host indices
+                extra_info,
+            )
+
             # Check termination
-            if (
-                operation.completed_tokens
-                != prev_completed_tokens + len(batch_hashes) * self.page_size
-            ):
+            stride_tokens = prev_completed_tokens + len(batch_hashes) * self.page_size
+            if operation.completed_tokens != stride_tokens:
                 operation.mark_terminate()
-                break  # Some operations fail or operation terminated by controller
+                # Some operations fail or operation terminated by controller
+                break
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
-        # release pre-allocated memory
+        # release pre-allocated memory, 这部分的 release 完全可以放到 sche 内执行
         self.append_host_mem_release(
             operation.host_indices[operation.completed_tokens :]
         )
@@ -657,6 +726,7 @@ class HiCacheController:
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 self._page_transfer(operation)
+
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]
@@ -675,13 +745,21 @@ class HiCacheController:
         return False
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        # NOTE(james): 这里是 last_host_page_hash
         last_hash = operation.last_hash
+
+        # 这里是 rest_input_tokens, 用于计算 page hash 和 prefetch
         tokens_to_fetch = operation.token_ids
+
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
 
+        # NOTE(james): 这里是真正的 storage hit count query
         storage_query_count = 0
         hash_value = []
 
+        # NOTE(james): 这里的循环逻辑是分批次查询 storage backend, 每批次查询
+        #              storage_batch_size 个 page, 每个 page 含 page_size 个 token,
+        #              每次查询 num_iter_tokens = storage_batch_size * page_size
         for start in range(
             0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
         ):
@@ -690,17 +768,25 @@ class HiCacheController:
             )
             batch_tokens = tokens_to_fetch[start:end]
             batch_hashes = []
+
             for i in range(0, len(batch_tokens), self.page_size):
                 last_hash = self.get_hash_str(
                     batch_tokens[i : i + self.page_size], last_hash
                 )
+
+                # NOTE(james): 记录的是每个 new page 的 hash
                 batch_hashes.append(last_hash)
+
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+
+            # 检查这些 page 中真真被命中的 page 数量.
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
+
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
                 break
+
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
@@ -713,13 +799,17 @@ class HiCacheController:
         self.prefetch_buffer = Queue()
         aux_thread = threading.Thread(target=self.prefetch_io_aux_func, daemon=True)
         aux_thread.start()
-        while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
+
+        while (not self.stop_event.is_set()) or (not self.prefetch_queue.empty()):
             try:
+                # NOTE(james): 阻塞模式, 在 queue 中 get 1秒钟, 如果当前 queue 为空,
+                #              get 时间超过了 1s, 则进入 except 分支, 继续循环
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
 
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
+
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
                         storage_hit_count, dtype=torch.int
@@ -733,24 +823,32 @@ class HiCacheController:
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
+                    # NOTE(james):
+                    #  如果命中的 tokens 数量无法达到 prefetch threshold, 则任务 prefetch 收益不足. 则:
+                    #  1. 将 req_id 投入到 prefetch_revoke_queue 内;
+                    #  2. 将为它腾出的 host kvcache memory 记录至 host_mem_release_queue;
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
+
                     logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
+                        f"Revoking prefetch for request {operation.request_id} "
+                        f"due to insufficient hits ({storage_hit_count})."
                     )
                 else:
+                    # 有效的 rest_input_tokes 对应的  hash_value
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
-                    # free the pre-allocated memory for pages that are not hit
-                    self.append_host_mem_release(
-                        operation.host_indices[storage_hit_count:]
-                    )
                     operation.host_indices = operation.host_indices[:storage_hit_count]
                     logger.debug(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
+
+                    # free the pre-allocated memory for pages that are not hit
+                    self.append_host_mem_release(
+                        operation.host_indices[storage_hit_count:]
+                    )
 
             except Empty:
                 continue
@@ -760,7 +858,7 @@ class HiCacheController:
         host_indices: torch.Tensor,
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
-        prefix_keys: Optional[List[str]] = None,
+        prefix_keys: Optional[List[str]] = None,  # all_prefix_nodes_hashes
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
@@ -788,14 +886,24 @@ class HiCacheController:
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
+
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
-            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+            # stride 是 storage_batch_size, 而以 page 为单位
+            # end = min(i + storage_batch_size, len(operation.hash_value))
+            # batch_hashed = operation.hash_value[i:end]
+            batch_hashes = operation.hash_value[
+                i : i + self.storage_batch_size
+            ]  # 即使右边越界, 会自动截止
+
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+
+            # 这里的  page_set_func 最好是 _page_set_zero_copy 版本
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(
