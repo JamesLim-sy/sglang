@@ -91,9 +91,10 @@ def _update_gather_batch(
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
 
 
+# [DP]: 真正 for dp_attention 阶段的 prepare 操作
 def prepare_mlp_sync_batch_raw(
-    local_batch: ScheduleBatch,
-    dp_size: int,
+    local_batch: ScheduleBatch,  # 对应当前 dp_rank 的 schedule_batch
+    dp_size: int,  # dp_size 的规模
     attn_tp_size: int,
     tp_group: GroupCoordinator,
     get_idle_batch: Callable[[], ScheduleBatch],
@@ -102,15 +103,18 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
 ):
-    # Check if other DP workers have running batches
+    # Check if other DP workers have running batches,
+    # 1. 核心是拿到 num_tokens 和 num_tokens_for_logprob
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
         num_tokens = 0
         num_tokens_for_logprob = 0
-    elif local_batch.forward_mode.is_decode():
+    elif local_batch.forward_mode.is_decode():  # decode  mode
         num_tokens = local_batch.batch_size()
         num_tokens_for_logprob = num_tokens
-    else:
-        num_tokens = local_batch.extend_num_tokens
+    elif local_batch.forward_mode.is_extend():  # prefill mode
+        num_tokens = (
+            local_batch.extend_num_tokens
+        )  # sum(len(req.input_ids) for req in batch)
         if local_batch.return_logprob:
             num_tokens_for_logprob = sum(
                 # We should have at least 1 token for sample in every case.
@@ -132,6 +136,7 @@ def prepare_mlp_sync_batch_raw(
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
 
+    # 2. 开启 tbo attention prepare
     tbo_preparer = TboDPAttentionPreparer()
     if len(offload_tags) == 0 and disable_overlap_schedule:
         group = tp_group.device_group
@@ -142,13 +147,14 @@ def prepare_mlp_sync_batch_raw(
 
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
 
+    # 3.
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
         tp_size=attn_tp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
         can_cuda_graph=can_cuda_graph,
-        is_extend_in_batch=is_extend_in_batch,
+        is_extend_in_batch=is_extend_in_batch,  # 判断是否 prefill-mode
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
     )
@@ -182,7 +188,7 @@ class SchedulerDPAttnMixin:
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
-            require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+            require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),  # True
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
         )

@@ -334,6 +334,23 @@ class SchedulerDisaggregationPrefillMixin:
         return batch
 
     """
+        2. prefill 侧会启动 start_prefill_threads, 该线程会在后台执行 recv_multipart()
+        接收来自 transfer_worker 的 TransferInfo, 并完成第 1 次 Req level 握手.
+        后续则会接收的是 decode KVReceiver 发送来的 TransferInfo, 完成
+
+        3. decode server 启动 PD 分离时构建 connection_pool, 并在构建 kv_receiver 时,
+        会寻找 decode node 对应 prefill ranks, 同时会在初始化阶段, 将自己的
+            ip:port
+            decode page_addr
+            deocode rank 属于 dst_tp_rank
+            decode node 的 dst_attn_tp_size
+
+            - 配合字段 "None" 发送给 prefill node, 实现第一次 node-level 握手.
+
+        4. decode node 也会启动 start_decode_threads,
+            该线程会在后台执行 recv_multipart() 接收来自 prefill node 的 TransferInfo, 完成第 1 次 Req level 握手.
+    """
+    """
         NOTE(james): PD 分离时的起点
         1. process_input_requests
             >>> _add_request_to_queue,
@@ -651,6 +668,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # only finished requests to running_batch.
                 self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
                 self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+
                 if self.enable_overlap:
                     # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                     self.chunked_req.tmp_end_idx = min(

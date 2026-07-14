@@ -345,9 +345,12 @@ class DecodePreallocQueue:
         allocatable_tokens = self._allocatable_tokens(count_retracted=False)
 
         for i, req in enumerate(self.retracted_queue):
+            # 1. 针对 retracted_queue 中存在的请求, 首先判断 max_running_bs 中是否有容量空间.
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
+            # 2. 判断至少需要的 page 空间大小:
+            #       origin_input_ids + output_ids + num_reserved_decode_tokens
             required_tokens_for_request = (
                 len(req.origin_input_ids)
                 + len(req.output_ids)
@@ -356,12 +359,19 @@ class DecodePreallocQueue:
             if required_tokens_for_request > allocatable_tokens:
                 break
 
+            # 3. 将请求送入至 resumed_reqs 内部
             resumed_reqs.append(req)
+
+            # 4. 将这个 req 在 retracted_queue 中的 idx 记录下来,
+            #    取消它的 retracted 状态, 为它分配 cache 空间.
             indices_to_remove.add(i)
             req.is_retracted = False
             self._pre_alloc(req)
             allocatable_tokens -= required_tokens_for_request
 
+            # 5. 将 cpu 上暂存的 kvcache 拷贝至 device page slot 上,
+            #    但这是个 schedule-stream 上的同步拷贝
+            #
             # load from cpu, release the cpu copy
             req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
@@ -377,6 +387,9 @@ class DecodePreallocQueue:
         if not self.queue:
             return
 
+        # 如果 queue 里所有请求都已经 waiting_for_input == True
+        #  (即全部 handshake 成功), 就直接 return 跳过本次 poll
+        # early_return 机制
         if all(decode_req.waiting_for_input for decode_req in self.queue):
             return
 
@@ -388,7 +401,9 @@ class DecodePreallocQueue:
             if poll == KVPoll.Bootstrapping:
                 pass
             elif poll == KVPoll.WaitingForInput:
-                decode_req.waiting_for_input = True
+                decode_req.waiting_for_input = (
+                    True  # 针对性改成 waiting_for_input = True
+                )
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -408,6 +423,7 @@ class DecodePreallocQueue:
 
     def pop_preallocated(self) -> List[DecodeRequest]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        # 1. 将 bootstrap::waiting 的 Req 改变成 Waiting=True 的状态
         self._update_handshake_waiters()
 
         preallocated_reqs = []
@@ -415,13 +431,22 @@ class DecodePreallocQueue:
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
+
+        # 2. 计算 retractable_tokens: all reqs in running_bs
         retractable_tokens = sum(
             len(r.origin_input_ids) + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
         )
+
+        # 3. 分配 kvcache slots.
+        # Q: 此时为什么 count_retracted = True ?
+        # A: FIFO 考虑: 因为我们要计算当前可用的 allocatable_tokens, 需要减去 retracted_queue
+        #    中的请求占用的 token 空间, 还是要优先考虑 fifo, 将 retracted_queue 中的请求恢复,
+        #    以便让它们尽快进入 decode 阶段.
         allocatable_tokens = self._allocatable_tokens(
-            retractable_tokens=retractable_tokens, count_retracted=True
+            retractable_tokens=retractable_tokens, count_retracted=True  # for fifo
         )
+
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
@@ -431,6 +456,8 @@ class DecodePreallocQueue:
                 indices_to_remove.add(i)
 
         # Then, preallocate the remaining requests if possible
+        # 4. 在 preallocate 阶段, 只考虑 waiting_for_input = True 的请求,
+        #    其他的请求继续等待 handshake 完成
         for i, decode_req in enumerate(self.queue):
             if i in indices_to_remove:
                 continue
@@ -471,6 +498,8 @@ class DecodePreallocQueue:
             # 1. alloc page for req
             self._pre_alloc(decode_req.req)
 
+            # 5. 实际分配 page_slot_addr, 并将 origin_input_ids 长度对应的 page_slot_addr
+            #    发送给 prefill node
             kv_indices = (
                 self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
                     : len(decode_req.req.origin_input_ids)
@@ -529,6 +558,7 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.init(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
+
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.decode_transfer_queue_entry_time = (
@@ -576,8 +606,14 @@ class DecodePreallocQueue:
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
 
+        # 排除:
+        # 1. len(self.scheduler.running_batch.reqs)  # 正在运行的请求
+        # 2. len(self.transfer_queue.queue)          # 等待传输的请求
+        # 3. len(self.scheduler.waiting_queue)       # 等待队列中的请求
+        #  排除这些请求之后, 剩余的 available_page_slot 空间.
         allocatable_tokens = available_size - max(
             # preserve some space for future decode
+            # num_reserved_decode_tokens : 用于 kvcache 内存预留, 为每个 decode 预分配一块 gen token 空间
             self.num_reserved_decode_tokens
             * (
                 len(self.scheduler.running_batch.reqs)
@@ -590,6 +626,23 @@ class DecodePreallocQueue:
 
         # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
+
+        # 代表 pre-iter 的 batch
+        """
+            WaitingQueue → (get_new_prebuilt_batch) →  PREBUILT batch
+                                                            ↓
+                                                    (merge into running_batch)
+                                                            ↓
+                                                        DECODE batch
+
+            NOTE: PREBUILT 就是一个专门为"KV cache 已就绪, 即将首次 decode,
+                  但本轮跳过 forward prefill "而设计的标签, 核心是复用
+                  process_batch_result 这个流程. 把 prefill 的流程全部走完.
+                    (1) output_ids 写入 req
+                    (2) logprob 记录
+                    (3) maybe_cache_unfinished_req 插 radix cache
+                    ....
+        """
         if (
             self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
@@ -728,6 +781,9 @@ class DecodeTransferQueue:
     def pop_transferred(self) -> List[Req]:
         if not self.queue:
             return []
+
+        # 由于采用 mooncake 执行传输, 那么 decode node 收集到 bootstrap::success 时,
+        # 即, 代表了 prefill 侧的 kv cache rdma 传输已经完成. decode node 可以进入 waiting_queue 阶段
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
@@ -787,7 +843,37 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
-
+        """
+            req
+            │
+            ▼
+            PreallocQueue.queue
+            │  handshake 完成 (KVPoll.WaitingForInput)
+            │  decode 侧预分配好 KV 内存槽位
+            │  send_metadata() 告诉 prefill: "你往这些槽位写"
+            ▼
+            TransferQueue.queue
+            │  poll KVPoll.Success (RDMA 传输完成)
+            │  _commit_transfer_to_req()
+            │    └─ output_ids[0] 写入 req   ← prefill 采样的第一个 token
+            ▼
+            waiting_queue
+            │  (同一轮 loop 的 process_decode_queue() 里就 extend 进去了)
+            ▼
+            get_new_prebuilt_batch()
+            │  从 waiting_queue 取出
+            │  prepare_for_prebuilt()  → forward_mode = PREBUILT
+            │  process_prebuilt()      → grammar accept_token, spec draft init 等
+            ▼
+            process_batch_result_prebuilt()
+            │  finish check, logprob, cached_tokens 修正等
+            │  (逻辑上等价于 prefill 侧的 process_batch_result_prefill)
+            ▼
+            merge_batch() 进 running_batch
+            │  running_batch.forward_mode = DECODE
+            ▼
+            run_batch(DECODE)  ← 真正开始生成 token
+        """
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -848,18 +934,46 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
         """Create fake completed prefill if possible and merge with running batch"""
+        """chunked prefill doesn't happen in decode instance."""
         # Merge the prefill batch into the running batch
+
+        """
+          Running batch 可以与 last_batch 不一样. 最典型的场景: 上一轮跑的是 prebuilt batch,
+          而这一轮要把这些新请求 merge 进已有的 running_batch
+            Iter N:
+            running_batch = [A, B]          # A、B 已经在 decode
+            waiting_queue = [C, D]          # C、D 刚从 prefill 传完 KV
+
+            get_next_disagg_decode_batch_to_run():
+                new_prebuilt_batch = [C, D]
+                ret = new_prebuilt_batch    # 跑 prebuilt fake forward
+            run_batch([C, D])               # last_batch = prebuilt_batch([C, D])
+
+            Iter N+1:
+            running_batch = [A, B]          # 还没变
+            last_batch = prebuilt_batch([C, D])
+
+            get_next_disagg_decode_batch_to_run():
+                if last_batch is prebuilt:
+                    last_batch.filter_batch()
+                    running_batch.merge_batch(last_batch)
+                                            # 现在 running_batch = [A, B, C, D]
+        """
+        # 1. 处理上一轮的 batch
         last_batch = self.last_batch
         if last_batch and last_batch.forward_mode.is_prebuilt():
-            # chunked prefill doesn't happen in decode instance.
+            # 2. 处理上一轮 batch 是 prebuilt 的情况, 需将 prebuilt batch merge 至 running_batch
+            # │ prev_iter 跑的是 prebuilt fake forward, batch 里的请求是刚从
+            # │ waiting_queue 中捞出, 即将转正但还没 merge 进 running_batch 的那批
             assert self.chunked_req is None
             # Filter finished batches.
-            last_batch.filter_batch()
+            last_batch.filter_batch()  # 过滤掉已经完成的请求
             if not last_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = last_batch
                 else:
                     # merge running_batch with prefill batch
+                    # [NOTE]: running_batch 可以与 last_batch 不一样,
                     self.running_batch.merge_batch(last_batch)
 
         new_prebuilt_batch = self.get_new_prebuilt_batch()
@@ -897,6 +1011,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
+        # available req slot for prebuilt reqs
         num_not_used_batch = batch_size - curr_batch_size
 
         # pop req from waiting queue
@@ -920,6 +1035,11 @@ class SchedulerDisaggregationDecodeMixin:
         for req in can_run_list:
             req.time_stats.forward_entry_time = time.perf_counter()
 
+        """
+           1. 首先判断 req_slots 内的 available_slots 是否足够;
+           2. 如果不够, 立即创建 prebuilt batch, 去跑 fake forward, 并 merge into running_batch;
+           3. 如果足够, 立即返回, 继续跑 running_batch
+        """
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -938,28 +1058,58 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        """
+        A. 合计有 5 个队列:
+          1. retracted_queue: decode 侧被撤回的请求, 等待恢复
+          2. prealloc_queue: decode 侧预分配的请求
+          3. transfer_queue: decode 侧等待 prefill 传输完成的请求
+          4. waiting_queue : decode 侧等待 prebuilt batch 的请求
+          5. running_batch : decode 侧正在运行的请求
+
+        B. 处理顺序分2类, 分别是 :
+          1. prealloc_queue -> transfer_queue -> waiting_queue -> running_batch
+          2. retracted_queue -> waiting_queue -> running_batch
+
+        C. 从 B 的逻辑可以看出, retracted req 也是从 prebuilt 阶段起步.
+
+        D.
+        """
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
-        # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
+        # try to resume retracted requests if there are enough space for
+        # another `num_reserved_decode_tokens` decode steps
+        # 1. 处理 retracted_queue 中的请求, 尝试恢复它们, 以便让它们尽快进入 decode 阶段
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return
 
+        # 2. decode 轮询的节流（throttling）机制, 配合 lazy initialization 初始化机制.
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
             self.polling_interval = (
                 self.server_args.disaggregation_decode_polling_interval
             )
 
+        # 控制每间隔多少个iter 才执行一次 pop_preallocated,
+        # polling_interval 设置为 1, 则每个 iter 都执行
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
+            # 3. 处理 per_alloc 中的请求 reqs
             req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
             self.disagg_decode_transfer_queue.extend(req_conns)
+
+            # 4. 处理 transfer_queue 中的请求, 将已经传输完成的请求转移到 waiting_queue 中
             alloc_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
             self.waiting_queue.extend(alloc_reqs)
+
+
+# - 优先级分析:
+# 1. max_running_bs 已满时, 优先计算 running_batch, 以便释放出 req_slot
+# 2. max_running_bs 未满时, 优先执行 prebuilt batch, 以便快速加入 running_batch
+# 3. waiting_queue 中的请求, retracted_req 的优先级高于 kv_transfer_queue 中的请求.

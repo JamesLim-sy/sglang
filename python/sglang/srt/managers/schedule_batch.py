@@ -1163,6 +1163,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             chunked_req=chunked_req,
         )
 
+    @property
     def batch_size(self):
         return len(self.reqs)
 
@@ -1446,7 +1447,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
-        running_bs = running_batch.batch_size()
+        running_bs = running_batch.batch_size
 
         for req in running_batch.reqs:
             req.fill_ids = req.origin_input_ids + req.output_ids
@@ -1700,6 +1701,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
             elif chunked_req_to_exclude is None:
                 chunked_req_to_exclude = []
+
+            # 核心是处理 finished_reqs
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
@@ -1724,6 +1727,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens = self.encoder_lens[keep_indices_device]
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
+        # 保留 keep_indices 指向的 reqs
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
@@ -1778,6 +1782,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
+
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
         if self.return_logprob and other.return_logprob:

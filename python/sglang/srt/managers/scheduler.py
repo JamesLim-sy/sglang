@@ -381,6 +381,7 @@ class Scheduler(
         # For #11910, use the CPU communication group to broadcast VLM Python objects,
         # avoiding any coupling with CUDA streams/devices.
         if self.server_args.enable_dp_attention:
+            # [DP]: 设置了 dp_attn 后, 就会将 entry_rank 设置为 attn_tp_rank_0
             self.cpu_group = self.attn_tp_cpu_group
             self.entry_rank = self.attn_tp_group.first_rank
             self.is_entry_rank = self.attn_tp_rank == 0
@@ -1114,6 +1115,8 @@ class Scheduler(
                 control_reqs = None
 
             if self.attn_tp_size != 1:
+                # dp_tp-rank-0     执行 broadcast_send
+                # dp_tp-rank-other 执行 broadcast_recv
                 work_reqs = broadcast_pyobj(
                     work_reqs,
                     self.attn_tp_group.rank,

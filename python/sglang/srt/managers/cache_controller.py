@@ -90,6 +90,9 @@ class LayerDoneCounter:
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
             return
+
+        # consumer_index 是为异步拷贝准备的
+        # threshold 是为 layerwise ids 准备的
         self.events[self.consumer_index].wait(threshold)
 
     def reset(self):
