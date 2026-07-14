@@ -21,6 +21,7 @@ class FastQueue:
         with self._cond:
             # if queue is empty  ,block until is notified()
             while not self._buf:
+                # 利用这的 wait() 和 notify() 来实现线程间的同步, 同时避免频繁 query 队列状态.
                 self._cond.wait()
             return self._buf.popleft()
 
